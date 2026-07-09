@@ -4,12 +4,14 @@ Economics Network in the trailing N days.
 
 Usage:
     pip install requests
-    python ssrn_digest.py --discover      (first run: confirm the FEN binding ID)
     python ssrn_digest.py                 (normal run: build the digest)
+    python ssrn_digest.py --rank per_day  (rank by downloads per day since posting)
+    python ssrn_digest.py --discover      (probe candidate binding IDs)
     python ssrn_digest.py --days 14 --top 25 --binding 203
 
-All raw API responses are saved under ./debug/ so if anything about the
-schema is off we can inspect exactly what SSRN returned.
+Binding 203 is confirmed as the Financial Economics Network.
+
+All raw API responses are saved under ./debug/ for troubleshooting.
 
 Output:
     prints the digest to stdout
@@ -17,6 +19,7 @@ Output:
 """
 
 import argparse
+import html
 import json
 import re
 import sys
@@ -75,6 +78,16 @@ DATE_FORMATS = [
     "%b %d, %Y",
     "%B %d, %Y",
 ]
+
+
+def clean_text(s):
+    if not isinstance(s, str):
+        return s
+    s = html.unescape(s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 
 def save_debug(name, payload):
@@ -151,9 +164,7 @@ def extract_papers_list(data):
 
 
 def normalize_paper(p):
-    title = p.get("title") or p.get("paper_title") or "(no title)"
-    if isinstance(title, str):
-        title = re.sub(r"<[^>]+>", "", title).strip()
+    title = clean_text(p.get("title") or p.get("paper_title") or "(no title)")
 
     abstract_id = (
         p.get("abstract_id")
@@ -177,11 +188,11 @@ def normalize_paper(p):
                     or " ".join(x for x in [a.get("firstName"), a.get("lastName")] if x)
                 )
                 if name:
-                    authors.append(name)
+                    authors.append(clean_text(name))
             elif isinstance(a, str):
-                authors.append(a)
+                authors.append(clean_text(a))
     elif isinstance(authors_raw, str):
-        authors = [authors_raw]
+        authors = [clean_text(authors_raw)]
 
     date_key, date_raw = first_present(p, DATE_FIELD_CANDIDATES)
     posted = parse_date(date_raw)
@@ -192,6 +203,13 @@ def normalize_paper(p):
     except ValueError:
         downloads = None
 
+    days_live = None
+    dl_per_day = None
+    if posted is not None:
+        days_live = max((datetime.now() - posted).days, 1)
+        if downloads is not None:
+            dl_per_day = downloads / days_live
+
     return {
         "title": title,
         "abstract_id": abstract_id,
@@ -200,6 +218,8 @@ def normalize_paper(p):
         "posted": posted.strftime("%Y-%m-%d") if posted else None,
         "_posted_dt": posted,
         "downloads": downloads,
+        "days_live": days_live,
+        "downloads_per_day": round(dl_per_day, 1) if dl_per_day is not None else None,
         "_date_field_used": date_key,
         "_download_field_used": dl_key,
     }
@@ -232,10 +252,9 @@ def discover(candidate_ids):
         print()
         time.sleep(SLEEP_BETWEEN_REQUESTS)
     print("Full raw responses are in debug/discover_binding_*.json")
-    print("Confirm which binding is Financial Economics, then run without --discover.")
 
 
-def build_digest(binding, days, top_n):
+def build_digest(binding, days, top_n, rank):
     cutoff = datetime.now() - timedelta(days=days)
     print(f"Fetching binding {binding}, papers posted on or after {cutoff.strftime('%Y-%m-%d')}.\n")
 
@@ -279,7 +298,7 @@ def build_digest(binding, days, top_n):
 
     if undated > 0 and len(papers) == 0:
         print("Every paper had an unparseable date. Check debug/page_1.json for the")
-        print("actual date field name and format, then we patch DATE_FIELD_CANDIDATES.")
+        print("actual date field name and format, then patch DATE_FIELD_CANDIDATES.")
         sys.exit(1)
 
     with_dl = [p for p in papers if p["downloads"] is not None]
@@ -287,19 +306,30 @@ def build_digest(binding, days, top_n):
         print(f"Note: {len(papers) - len(with_dl)} papers had no download count and were excluded from ranking.")
     if not with_dl:
         print("No download counts found on any paper. Check debug/page_1.json for the")
-        print("actual field name, then we patch DOWNLOAD_FIELD_CANDIDATES.")
+        print("actual field name, then patch DOWNLOAD_FIELD_CANDIDATES.")
         sys.exit(1)
 
-    ranked = sorted(with_dl, key=lambda p: p["downloads"], reverse=True)[:top_n]
+    if rank == "per_day":
+        sort_key = lambda p: p["downloads_per_day"] or 0
+        rank_label = "DOWNLOADS PER DAY"
+    else:
+        sort_key = lambda p: p["downloads"]
+        rank_label = "DOWNLOADS"
+
+    ranked = sorted(with_dl, key=sort_key, reverse=True)[:top_n]
 
     print(f"\n{'=' * 78}")
-    print(f"TOP {len(ranked)} SSRN PAPERS BY DOWNLOADS, POSTED IN LAST {days} DAYS (binding {binding})")
+    print(f"TOP {len(ranked)} SSRN PAPERS BY {rank_label}, POSTED IN LAST {days} DAYS (binding {binding})")
     print(f"{'=' * 78}\n")
     for i, p in enumerate(ranked, 1):
         authors = ", ".join(p["authors"][:4])
         if len(p["authors"]) > 4:
             authors += " et al."
-        print(f"{i:2d}. [{p['downloads']:,} dl] {p['title']}")
+        if rank == "per_day":
+            metric = f"{p['downloads_per_day']:.1f} dl/day, {p['downloads']:,} total"
+        else:
+            metric = f"{p['downloads']:,} dl"
+        print(f"{i:2d}. [{metric}] {p['title']}")
         if authors:
             print(f"      {authors}")
         print(f"      posted {p['posted']}  |  {p['url']}\n")
@@ -314,15 +344,16 @@ def build_digest(binding, days, top_n):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--discover", action="store_true", help="probe candidate binding IDs and exit")
-    ap.add_argument("--binding", type=int, default=DEFAULT_BINDING, help="SSRN binding ID (default 203)")
+    ap.add_argument("--binding", type=int, default=DEFAULT_BINDING, help="SSRN binding ID (default 203, FEN)")
     ap.add_argument("--days", type=int, default=7, help="trailing window in days (default 7)")
     ap.add_argument("--top", type=int, default=25, help="number of papers in digest (default 25)")
+    ap.add_argument("--rank", choices=["total", "per_day"], default="total", help="ranking metric (default total downloads)")
     args = ap.parse_args()
 
     if args.discover:
         discover([202, 203, 204, 205, 3388738])
     else:
-        build_digest(args.binding, args.days, args.top)
+        build_digest(args.binding, args.days, args.top, args.rank)
 
 
 if __name__ == "__main__":
