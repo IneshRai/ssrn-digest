@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import requests
+from curl_cffi import requests  # requests-compatible client with browser TLS fingerprint
 
 # journal_id from the browse URL works as the binding id
 # 203 = Financial Economics Network
@@ -39,7 +39,8 @@ def clean(s):
 
 def get(binding, index, count):
     r = requests.get(API.format(binding), headers=HEADERS,
-                     params={"index": index, "count": count, "sort": 0}, timeout=30)
+                     params={"index": index, "count": count, "sort": 0},
+                     impersonate="chrome", timeout=30)
     r.raise_for_status()
     data = r.json()
     DEBUG.mkdir(exist_ok=True)
